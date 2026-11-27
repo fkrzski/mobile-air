@@ -1,0 +1,106 @@
+name: iOS splash check
+
+# Fork-only check for the animated splash: a fresh app with an animated
+# splash.webp is built for the simulator, launched, and recorded, since the
+# iOS Build workflow only compiles the Swift.
+
+on:
+  push:
+    branches: [ci/ios-splash-check]
+  workflow_dispatch:
+
+jobs:
+  splash:
+    runs-on: xcode-27
+    timeout-minutes: 45
+
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
+      LANG: en_US.UTF-8
+      LC_ALL: en_US.UTF-8
+
+    steps:
+      - name: Checkout mobile-air
+        uses: actions/checkout@v4
+        with:
+          path: mobile-air
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: 8.4
+          extensions: dom, simplexml, mbstring, zip, sodium
+          coverage: none
+
+      - name: Create an app with an animated splash
+        working-directory: ${{ runner.temp }}
+        run: |
+          composer create-project laravel/laravel app --prefer-dist --no-interaction --no-scripts --quiet
+          cd app
+          cp .env.example .env
+          php artisan key:generate --no-interaction
+          echo "NATIVEPHP_APP_ID=com.nativephp.ci" >> .env
+          composer config repositories.mobile '{"type": "path", "url": "${{ github.workspace }}/mobile-air", "options": {"versions": {"nativephp/mobile": "4.99.0"}}}'
+          composer require nativephp/mobile:4.99.0 --no-interaction
+          cp "${{ github.workspace }}/mobile-air/.github/ios-splash-check/splash.webp" public/splash.webp
+          cp "${{ github.workspace }}/mobile-air/.github/ios-splash-check/splash.png" public/splash.png
+
+      - name: Install the iOS project
+        working-directory: ${{ runner.temp }}/app
+        run: php artisan native:install ios --no-interaction
+
+      - name: Build Debug for the simulator
+        working-directory: ${{ runner.temp }}/app
+        run: php artisan native:build --simulated --no-tty --no-interaction
+
+      - name: Show the splash assets in the build
+        working-directory: ${{ runner.temp }}/app/nativephp/ios
+        run: |
+          ls NativePHP/Assets.xcassets NativePHP/Assets.xcassets/SplashAnimation.dataset || true
+          xcrun assetutil --info build/Build/Products/Debug-iphonesimulator/NativePHP-simulator.app/Assets.car \
+            | grep -B2 -A6 -E 'SplashAnimation|LaunchImage' || echo "no splash assets in Assets.car"
+
+      - name: Launch in the simulator and record it
+        working-directory: ${{ runner.temp }}/app/nativephp/ios
+        run: |
+          out="$RUNNER_TEMP/splash"
+          mkdir -p "$out"
+
+          udid=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          devices = json.load(sys.stdin)["devices"]
+          print(next(d["udid"] for runtime, ds in devices.items() if "iOS" in runtime for d in ds if d["name"].startswith("iPhone")))
+          ')
+          echo "Simulator: $udid"
+
+          xcrun simctl boot "$udid"
+          xcrun simctl bootstatus "$udid" -b
+          xcrun simctl install "$udid" build/Build/Products/Debug-iphonesimulator/NativePHP-simulator.app
+
+          xcrun simctl io "$udid" recordVideo --codec=h264 --force "$out/launch.mp4" &
+          recorder=$!
+          sleep 3
+
+          xcrun simctl launch "$udid" com.nativephp.ci
+          for i in $(seq -w 1 12); do
+            xcrun simctl io "$udid" screenshot "$out/shot-$i.png" > /dev/null 2>&1 || true
+          done
+          sleep 15
+
+          kill -INT "$recorder"
+          wait "$recorder" || true
+
+          xcrun simctl io "$udid" screenshot "$out/after.png"
+          xcrun simctl spawn "$udid" log show --last 3m --style compact \
+            --predicate 'process CONTAINS "NativePHP"' > "$out/app.log" 2>&1 || true
+
+      - name: Upload the recording
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-splash-check
+          path: |
+            ${{ runner.temp }}/splash
+            ${{ runner.temp }}/app/nativephp/ios-build.log
+          if-no-files-found: ignore
+          retention-days: 7
