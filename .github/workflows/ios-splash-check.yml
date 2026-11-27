@@ -45,6 +45,20 @@ jobs:
           cp "${{ github.workspace }}/mobile-air/.github/ios-splash-check/splash.webp" public/splash.webp
           cp "${{ github.workspace }}/mobile-air/.github/ios-splash-check/splash.png" public/splash.png
 
+          # A fresh app reaches first content in about a second; the splash
+          # hides then, so the first route waits long enough to watch it.
+          cat > routes/web.php <<'PHP'
+          <?php
+
+          use Illuminate\Support\Facades\Route;
+
+          Route::get('/', function () {
+              sleep(6);
+
+              return view('welcome');
+          });
+          PHP
+
       - name: Install the iOS project
         working-directory: ${{ runner.temp }}/app
         run: php artisan native:install ios --no-interaction
@@ -77,15 +91,17 @@ jobs:
           xcrun simctl bootstatus "$udid" -b
           xcrun simctl install "$udid" build/Build/Products/Debug-iphonesimulator/NativePHP-simulator.app
 
-          xcrun simctl io "$udid" recordVideo --codec=h264 --force "$out/launch.mp4" &
+          xcrun simctl io "$udid" recordVideo --codec=h264 --force "$out/launch.mp4" 2> "$out/record.log" &
           recorder=$!
-          sleep 3
+          for i in $(seq 1 120); do
+            grep -q "Recording started" "$out/record.log" && break
+            sleep 0.5
+          done
+          cat "$out/record.log"
+          sleep 2
 
           xcrun simctl launch "$udid" com.nativephp.ci
-          for i in $(seq -w 1 12); do
-            xcrun simctl io "$udid" screenshot "$out/shot-$i.png" > /dev/null 2>&1 || true
-          done
-          sleep 15
+          sleep 20
 
           kill -INT "$recorder"
           wait "$recorder" || true
